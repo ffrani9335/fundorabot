@@ -3,6 +3,9 @@ const QRCode = require('qrcode');
 const express = require('express');
 const bodyParser = require('body-parser');
 
+console.log('BOT_TOKEN:', process.env.BOT_TOKEN);
+console.log('ADMIN_CHAT_ID:', process.env.ADMIN_CHAT_ID);
+
 const BOT_TOKEN = process.env.BOT_TOKEN || '8114710727:AAFb76pLg6QhHed3JB0WyHXQcsbpDJXVq4U';
 const API_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const UPI_ID = 'fundora@kiwi';
@@ -16,11 +19,19 @@ let pending_payments = {}; // user_id: {amount, plan, step, utr, screenshot_file
 let pending_withdrawals = {}; // user_id: {method, details, amount, status}
 
 async function sendMessage(chat_id, text, opts = {}) {
-  await axios.post(`${API_URL}/sendMessage`, { chat_id, text, ...opts });
+  try {
+    await axios.post(`${API_URL}/sendMessage`, { chat_id, text, ...opts });
+  } catch (err) {
+    console.error('sendMessage error:', err.response ? JSON.stringify(err.response.data) : err.message);
+  }
 }
 
 async function sendPhoto(chat_id, photo, caption) {
-  await axios.post(`${API_URL}/sendPhoto`, { chat_id, photo, caption });
+  try {
+    await axios.post(`${API_URL}/sendPhoto`, { chat_id, photo, caption });
+  } catch (err) {
+    console.error('sendPhoto error:', err.response ? JSON.stringify(err.response.data) : err.message);
+  }
 }
 
 function getUPILink(amount, note = 'Fundora Investment') {
@@ -28,9 +39,13 @@ function getUPILink(amount, note = 'Fundora Investment') {
 }
 
 async function sendUPIQR(chat_id, amount) {
-  const upiLink = getUPILink(amount);
-  const qr = await QRCode.toDataURL(upiLink);
-  await sendPhoto(chat_id, qr, `Scan to pay ₹${amount} to Fundora\nUPI ID: ${UPI_ID}\n[Pay Now](${upiLink})`);
+  try {
+    const upiLink = getUPILink(amount);
+    const qr = await QRCode.toDataURL(upiLink);
+    await sendPhoto(chat_id, qr, `Scan to pay ₹${amount} to Fundora\nUPI ID: ${UPI_ID}\n[Pay Now](${upiLink})`);
+  } catch (err) {
+    console.error('sendUPIQR error:', err.message);
+  }
 }
 
 async function handleUpdate(body) {
@@ -204,7 +219,6 @@ async function handleUpdate(body) {
       amount: u.wallet_balance,
       status: 'awaiting_method'
     };
-    // Wallet balance zero kar do, admin approve karega to payment hoga
     u.wallet_balance = 0;
   }
 
@@ -213,7 +227,7 @@ async function handleUpdate(body) {
   }
 
   else if (text === '/support') {
-    await sendMessage(chat_id, 'Contact admin: @youradminusername');
+    await sendMessage(chat_id, 'Contact agent: @fundoraagent');
   }
 
   // Admin approval command for investment
@@ -262,7 +276,6 @@ async function handleUpdate(body) {
       await sendMessage(chat_id, 'No pending withdrawal for this user.');
       return;
     }
-    // Refund wallet
     users[reject_user_id].wallet_balance += pending.amount;
     await sendMessage(reject_user_id, `❌ Your withdrawal of ₹${pending.amount} has been rejected. Amount refunded to your wallet.`);
     await sendMessage(chat_id, `Rejected withdrawal for user ${reject_user_id}.`);
