@@ -1,211 +1,308 @@
 const axios = require('axios');
+const QRCode = require('qrcode');
 const express = require('express');
 const bodyParser = require('body-parser');
+const crypto = require('crypto');
 
-// --- ⚙️ CONFIGURATION (Your details are already here) ---
 const BOT_TOKEN = '8114710727:AAFb76pLg6QhHed3JB0WyHXQcsbpDJXVq4U';
-const ADMIN_CHAT_ID = '7972815378'; // Your correct numeric Admin ID
-
-const UPI_ID = 'fundora@kiwi';
-const BOT_USERNAME = 'fundoraxbot';
-const SUPPORT_USERNAME = 'fundoraagent';
 const API_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
-const WEBHOOK_URL = `https://funderabot.onrender.com/webhook`; // Your Render URL
+const UPI_ID = 'fundora@kiwi';
+const ADMIN_CHAT_ID = 'YOUR_ADMIN_CHAT_ID'; // Replace with your Telegram user ID
 
-// --- 💾 IN-MEMORY DATABASE ---
 let users = {};
+let investments = [];
+let withdrawals = [];
+let referrals = [];
 let pending_payments = {};
 let pending_withdrawals = {};
-let investments = [];
 
-// --- 🤖 TELEGRAM HELPER FUNCTIONS ---
+// Generate unique referral code
+function generateReferralCode() {
+  return 'FND' + crypto.randomBytes(3).toString('hex').toUpperCase();
+}
+
+// Telegram API helpers
 async function sendMessage(chat_id, text, opts = {}) {
-  try {
-    await axios.post(`${API_URL}/sendMessage`, { chat_id, text, parse_mode: 'Markdown', ...opts });
-  } catch (error) {
-    console.error(`Error sending message to ${chat_id}:`, error.response ? error.response.data : error.message);
-  }
+  await axios.post(`${API_URL}/sendMessage`, { chat_id, text, ...opts });
 }
 
-async function sendPhoto(chat_id, photo, caption, opts = {}) {
-  try {
-    await axios.post(`${API_URL}/sendPhoto`, { chat_id, photo, caption, parse_mode: 'Markdown', ...opts });
-  } catch (error) {
-    console.error(`Error sending photo to ${chat_id}:`, error.response ? error.response.data : error.message);
-  }
+async function sendPhoto(chat_id, photo, caption) {
+  await axios.post(`${API_URL}/sendPhoto`, { chat_id, photo, caption, parse_mode: 'Markdown' });
 }
 
-// ---  MAIN BOT LOGIC ---
+function getUPILink(amount, note = 'Fundora Investment') {
+  return `upi://pay?pa=${UPI_ID}&pn=Fundora&am=${amount}&cu=INR&tn=${encodeURIComponent(note)}`;
+}
+
+async function sendUPIQR(chat_id, amount) {
+  const upiLink = getUPILink(amount);
+  const qr = await QRCode.toDataURL(upiLink);
+  await sendPhoto(chat_id, qr, `Scan to pay ₹${amount} to Fundora\nUPI ID: ${UPI_ID}\n[Pay Now](${upiLink})`);
+}
+
+// Main handler
 async function handleUpdate(body) {
-  const message = body.message || (body.callback_query && body.callback_query.message);
-  if (!message) {
-    console.log("Received a non-message update, skipping.");
-    return;
-  }
+  if (!body.message) return;
 
-  const chat_id = message.chat.id.toString(); // Use string for consistency
+  const chat_id = body.message.chat.id;
+  const text = (body.message.text || '').trim().toLowerCase();
   const user_id = chat_id;
-  const text = (message.text || '').trim();
-  const photo = message.photo;
-  const is_admin = (chat_id === ADMIN_CHAT_ID);
 
+  // Register user
   if (!users[user_id]) {
     users[user_id] = {
-      id: user_id, name: message.chat.first_name || 'User', wallet_balance: 0,
-      referral_earning: 0, total_withdrawn: 0, active_investments: 0,
-      referral_code: `FND${user_id}`, referred_by: null, state: null, state_data: {}
+      id: user_id,
+      name: body.message.from.first_name,
+      wallet_balance: 0,
+      referral_earning: 0,
+      total_withdrawn: 0,
+      active_investments: 0,
+      level: 0,
+      referral_code: generateReferralCode(),
+      referred_by: null,
+      withdraw_method: null,
+      withdraw_details: {}
     };
   }
+
   const user = users[user_id];
 
-  // --- STATE-BASED INPUT (Handles multi-step actions like payments) ---
-  if (user.state) {
-    switch (user.state) {
-      case 'awaiting_utr':
-        if (text && text.match(/^\d{10,18}$/)) {
-            pending_payments[user_id].utr = text;
-            user.state = 'awaiting_screenshot';
-            await sendMessage(chat_id, '✅ UTR received.\n\nNow, please upload the payment screenshot.');
-        } else {
-            await sendMessage(chat_id, '❌ Invalid UTR. Please send a valid UPI Transaction ID (usually 12 digits).');
-        }
-        return;
-      case 'awaiting_screenshot':
-        if (photo) {
-            const file_id = photo[photo.length - 1].file_id;
-            pending_payments[user_id].screenshot_file_id = file_id;
-            user.state = null;
-            const pending = pending_payments[user_id];
-            await sendMessage(chat_id, '🕒 Thank you! Your payment is submitted and is now pending approval.');
-            const adminCaption = `🆕 New Payment Pending\n\n*User:* ${user.name} (\`${user_id}\`)\n*Plan:* ${pending.plan.plan_name}\n*Amount:* ₹${pending.amount}\n*UTR:* \`${pending.utr}\`\n\nApprove: /approve_${user_id}\nReject: /reject_${user_id}`;
-            await sendPhoto(ADMIN_CHAT_ID, file_id, adminCaption);
-        } else {
-            await sendMessage(chat_id, '❌ That\'s not a photo. Please upload your payment screenshot.');
-        }
-        return;
-      // ... other states for withdrawal ...
+  // Handle pending payment
+  if (pending_payments[user_id]) {
+    const pending = pending_payments[user_id];
+
+    if (pending.step === 1 && text.match(/^\d{10,}$/)) {
+      pending.utr = text;
+      pending.step = 2;
+      await sendMessage(chat_id, '✅ UTR received.\nNow, please upload the payment screenshot.');
+      return;
     }
-    // If we are in a state, we stop further command processing
-    return;
+
+    if (pending.step === 2 && body.message.photo) {
+      const photoArray = body.message.photo;
+      const file_id = photoArray[photoArray.length - 1].file_id;
+      pending.screenshot_file_id = file_id;
+      pending.step = 3;
+
+      await sendMessage(chat_id, '🕒 Payment details submitted. Waiting for admin approval.');
+      await sendPhoto(
+        ADMIN_CHAT_ID,
+        file_id,
+        `🔔 New Payment Request\nUser: ${user.name} (${user_id})\nPlan: ${pending.plan.plan_name}\nAmount: ₹${pending.amount}\nUTR: ${pending.utr}\n\n✅ Approve: /approve_${user_id}\n❌ Reject: /reject_${user_id}`
+      );
+      return;
+    }
   }
 
-  // --- COMMAND AND TEXT HANDLERS ---
-  const lowerCaseText = text.toLowerCase();
+  // Handle pending withdrawal
+  if (user.withdraw_method && !user.withdraw_details.complete) {
+    if (user.withdraw_method === 'upi') {
+      if (!user.withdraw_details.upi_id) {
+        user.withdraw_details.upi_id = text;
+        await sendMessage(chat_id, 'Enter UPI Name:');
+        return;
+      }
+      if (!user.withdraw_details.upi_name) {
+        user.withdraw_details.upi_name = text;
+        user.withdraw_details.complete = true;
+        await sendMessage(chat_id, '✅ Withdrawal request submitted. Admin will process it soon.');
+        pending_withdrawals[user_id] = {
+          amount: user.wallet_balance,
+          method: 'upi',
+          details: user.withdraw_details,
+          status: 'pending'
+        };
+        await sendMessage(
+          ADMIN_CHAT_ID,
+          `💸 Withdrawal Request\nUser: ${user.name} (${user_id})\nAmount: ₹${user.wallet_balance}\nMethod: UPI\nUPI ID: ${user.withdraw_details.upi_id}\nName: ${user.withdraw_details.upi_name}\n\n✅ Approve: /withdraw_approve_${user_id}\n❌ Reject: /withdraw_reject_${user_id}`
+        );
+        user.wallet_balance = 0;
+        user.withdraw_method = null;
+        user.withdraw_details = {};
+        return;
+      }
+    }
 
-  // FIX: Handle "invest 1" and "1" as replies to /invest
-  if (lowerCaseText.startsWith('invest ') || lowerCaseText.match(/^[12]$/)) {
-      let planId = lowerCaseText.replace('invest ', '');
-      if (!['1', '2'].includes(planId)) {
-        // Fallback for unknown commands
-      } else {
-        const plan = planId === '1'
-            ? { plan_name: 'Fundora Industry', amount: 100, return_amount: 150, duration: 45 }
-            : { plan_name: 'Fundora Space', amount: 200, return_amount: 400, duration: 90 };
-        
-        const upiLink = `upi://pay?pa=${UPI_ID}&pn=Fundora&am=${plan.amount}&cu=INR&tn=Fundora_Investment`;
-        const caption = `Tap to copy the UPI ID or use the link to pay ₹${plan.amount}.\n\n*UPI ID:* \`${UPI_ID}\`\n\n[Pay ₹${plan.amount} via UPI](${upiLink})`;
-        await sendMessage(chat_id, caption);
-        
-        pending_payments[user_id] = { amount: plan.amount, plan: plan };
-        user.state = 'awaiting_utr';
-        await sendMessage(chat_id, 'After paying, please reply with the *UPI Transaction ID (UTR)*.');
-        return; // Important: Stop processing after this
+    if (user.withdraw_method === 'bank') {
+      if (!user.withdraw_details.account_no) {
+        user.withdraw_details.account_no = text;
+        await sendMessage(chat_id, 'Enter IFSC Code:');
+        return;
       }
-  }
-  
-  // --- ADMIN COMMANDS ---
-  if (is_admin) {
-      if (lowerCaseText.startsWith('/approve_')) {
-          const id = text.split('_')[1];
-          const p = pending_payments[id];
-          if (!p) { await sendMessage(ADMIN_CHAT_ID, `No pending payment for ${id}.`); return; }
-          investments.push({ id: investments.length + 1, user_id: id, status: 'active', ...p.plan, start_date: new Date(), end_date: new Date(Date.now() + p.plan.duration * 24 * 60 * 60 * 1000) });
-          const u = users[id]; u.active_investments += 1;
-          if (u.referred_by && u.active_investments === 1) {
-              const r = Object.values(users).find(usr => usr.referral_code === u.referred_by);
-              if (r) { r.referral_earning += 20; r.wallet_balance += 20; await sendMessage(r.id, `🎉 You received ₹20 bonus as ${u.name} invested!`); }
-          }
-          await sendMessage(id, `✅ Your investment is approved!\n*Plan:* ${p.plan.plan_name}\n*Amount:* ₹${p.amount}`);
-          await sendMessage(ADMIN_CHAT_ID, `✅ Approved investment for ${id}.`);
-          delete pending_payments[id];
-          return;
+      if (!user.withdraw_details.ifsc) {
+        user.withdraw_details.ifsc = text;
+        await sendMessage(chat_id, 'Enter Account Holder Name:');
+        return;
       }
-      if (lowerCaseText.startsWith('/reject_')) {
-          const id = text.split('_')[1];
-          if (pending_payments[id]) {
-              delete pending_payments[id];
-              await sendMessage(id, '❌ Your payment was rejected. Contact support.');
-              await sendMessage(ADMIN_CHAT_ID, `❌ Rejected payment for ${id}.`);
-          }
-          return;
+      if (!user.withdraw_details.name) {
+        user.withdraw_details.name = text;
+        user.withdraw_details.complete = true;
+        await sendMessage(chat_id, '✅ Withdrawal request submitted. Admin will process it soon.');
+        pending_withdrawals[user_id] = {
+          amount: user.wallet_balance,
+          method: 'bank',
+          details: user.withdraw_details,
+          status: 'pending'
+        };
+        await sendMessage(
+          ADMIN_CHAT_ID,
+          `💸 Withdrawal Request\nUser: ${user.name} (${user_id})\nAmount: ₹${user.wallet_balance}\nMethod: Bank\nAccount: ${user.withdraw_details.account_no}\nIFSC: ${user.withdraw_details.ifsc}\nName: ${user.withdraw_details.name}\n\n✅ Approve: /withdraw_approve_${user_id}\n❌ Reject: /withdraw_reject_${user_id}`
+        );
+        user.wallet_balance = 0;
+        user.withdraw_method = null;
+        user.withdraw_details = {};
+        return;
       }
-      // ... other admin commands for withdrawal ...
+    }
   }
 
-  // --- REGULAR USER COMMANDS ---
-  switch (lowerCaseText) {
-    case '/start':
-      const refCode = text.split(' ')[1] || null;
-      if (refCode && !user.referred_by && refCode !== user.referral_code) {
-        user.referred_by = refCode;
-        await sendMessage(chat_id, `You were referred by user ${refCode}.`);
-      }
-      await sendMessage(chat_id, `👋 Welcome to Fundora, ${user.name}!\n\n/invest - Start an investment\n/wallet - Check your balance\n/withdraw - Withdraw earnings\n/refer - Get referral link\n/support - Contact support`);
-      break;
-    case '/invest':
-      await sendMessage(chat_id, `Choose a plan by replying with \`1\` or \`2\`:\n\n*1. Fundora Industry*\n> Invest: ₹100, Return: 50% in 45 days\n\n*2. Fundora Space*\n> Invest: ₹200, Return: 100% in 90 days`);
-      break;
-    case '/wallet':
-      await sendMessage(chat_id, `*Wallet* 🏦\n\nBalance: ₹${user.wallet_balance.toFixed(2)}\nReferral Earning: ₹${user.referral_earning.toFixed(2)}\nTotal Withdrawn: ₹${user.total_withdrawn.toFixed(2)}`);
-      break;
-    case '/withdraw':
-        if (user.wallet_balance < 50) {
-            await sendMessage(chat_id, '❌ Minimum ₹50 required to withdraw.');
-        } else {
-            // Add withdrawal logic here
-            await sendMessage(chat_id, "Withdrawal feature coming soon!");
-        }
-        break;
-    case '/refer':
-      await sendMessage(chat_id, `Your referral link:\nhttps://t.me/${BOT_USERNAME}?start=${user.referral_code}\n\n*Total Referral Earnings:* ₹${user.referral_earning}`);
-      break;
-    case '/support':
-      await sendMessage(chat_id, `For help, contact support: @${SUPPORT_USERNAME}`);
-      break;
-    default:
-        // This will catch commands that are not defined, like when you sent "1" from the admin account.
-        // If the user is an admin and the command isn't an admin command, we do nothing.
-        // If the user is not an admin, we tell them it's an unknown command.
-        if (!is_admin) {
-            await sendMessage(chat_id, 'Sorry, I don\'t understand that command. Use /start to see the options.');
-        }
+  // Command handlers
+  if (text.startsWith('/start')) {
+    const ref = text.split(' ')[1] || null;
+    if (ref && !user.referred_by && ref !== user.referral_code) {
+      user.referred_by = ref;
+      referrals.push({ from_user: ref, to_user: user_id, commission: 20, created_at: new Date() });
+    }
+    await sendMessage(chat_id, `👋 Welcome to Fundora!\nYour referral code: ${user.referral_code}\nUse /invest to start.`);
+  }
+
+  else if (text === '/wallet') {
+    await sendMessage(chat_id, `💰 Wallet: ₹${user.wallet_balance}\nReferral: ₹${user.referral_earning}\nWithdrawn: ₹${user.total_withdrawn}\nActive Investments: ${user.active_investments}`);
+  }
+
+  else if (text === '/invest') {
+    await sendMessage(chat_id, `Choose a plan:\n1. Fundora Industry: ₹100, 50% in 45 days\n2. Fundora Space: ₹200, 100% in 90 days\n\nReply: invest 1 or invest 2`);
+  }
+
+  else if (text.startsWith('invest')) {
+    const plan = text.split(' ')[1];
+    const planObj = plan === '1'
+      ? { plan_name: 'Fundora Industry', amount: 100, return_amount: 150, duration: 45 }
+      : { plan_name: 'Fundora Space', amount: 200, return_amount: 400, duration: 90 };
+
+    if (!planObj) return await sendMessage(chat_id, 'Invalid plan. Use /invest to see options.');
+
+    await sendUPIQR(chat_id, planObj.amount);
+    await sendMessage(chat_id, `After payment, reply: paid ${planObj.amount}`);
+    user.pending_investment = planObj;
+  }
+
+  else if (text.startsWith('paid')) {
+    const amt = parseInt(text.split(' ')[1]);
+    const planObj = user.pending_investment;
+    if (!planObj || planObj.amount !== amt) {
+      return await sendMessage(chat_id, 'No matching pending investment. Use /invest to start.');
+    }
+    pending_payments[user_id] = {
+      amount: amt,
+      plan: planObj,
+      step: 1,
+      utr: null,
+      screenshot_file_id: null
+    };
+    await sendMessage(chat_id, 'Please enter your UPI Transaction ID (UTR).');
+  }
+
+  else if (text === '/myorders') {
+    const myInv = investments.filter(i => i.user_id === user_id);
+    if (!myInv.length) return await sendMessage(chat_id, 'No active investments.');
+    const msg = myInv.map(i => `${i.plan_name}: ₹${i.amount}, Ends: ${i.end_date.toDateString()}`).join('\n');
+    await sendMessage(chat_id, msg);
+  }
+
+  else if (text === '/withdraw') {
+    if (user.wallet_balance < 50) return await sendMessage(chat_id, 'Minimum ₹50 required to withdraw.');
+    await sendMessage(chat_id, 'Withdraw via UPI or Bank?\nReply: upi or bank');
+    user.withdraw_method = null;
+    user.withdraw_details = {};
+  }
+
+  else if (text === 'upi' || text === 'bank') {
+    user.withdraw_method = text;
+    if (text === 'upi') {
+      await sendMessage(chat_id, 'Enter UPI ID:');
+    } else {
+      await sendMessage(chat_id, 'Enter Bank Account Number:');
+    }
+  }
+
+  else if (text === '/refer') {
+    await sendMessage(chat_id, `Invite link: https://t.me/fundoraxbot?start=${user.referral_code}\nEarnings: ₹${user.referral_earning}`);
+  }
+
+  else if (text === '/support') {
+    await sendMessage(chat_id, 'For support, contact: @chieffundora');
+  }
+
+  // Admin commands
+  else if (text.startsWith('/approve_') && chat_id.toString() === ADMIN_CHAT_ID) {
+    const uid = text.split('_')[1];
+    const pending = pending_payments[uid];
+    if (!pending) return await sendMessage(chat_id, 'No pending payment for this user.');
+    investments.push({
+      id: investments.length + 1,
+      user_id: uid,
+      ...pending.plan,
+      status: 'active',
+      start_date: new Date(),
+      end_date: new Date(Date.now() + pending.plan.duration * 24 * 60 * 60 * 1000)
+    });
+    users[uid].active_investments += 1;
+    users[uid].pending_investment = null;
+
+    if (users[uid].referred_by) {
+      const refUser = Object.values(users).find(u => u.referral_code === users[uid].referred_by);
+      if (refUser) refUser.referral_earning += 20;
+    }
+
+    await sendMessage(uid, `✅ Your investment is approved!\nPlan: ${pending.plan.plan_name}\nAmount: ₹${pending.amount}\nReturn: ₹${pending.plan.return_amount} in ${pending.plan.duration} days.`);
+    await sendMessage(chat_id, `Approved investment for user ${uid}.`);
+    delete pending_payments[uid];
+  }
+
+  else if (text.startsWith('/reject_') && chat_id.toString() === ADMIN_CHAT_ID) {
+    const uid = text.split('_')[1];
+    if (!pending_payments[uid]) return await sendMessage(chat_id, 'No pending payment for this user.');
+    await sendMessage(uid, '❌ Your payment was rejected. Contact @chieffundora for help.');
+    delete pending_payments[uid];
+    await sendMessage(chat_id, `Rejected payment for user ${uid}.`);
+  }
+
+  else if (text.startsWith('/withdraw_approve_') && chat_id.toString() === ADMIN_CHAT_ID) {
+    const uid = text.split('_')[2];
+    const w = pending_withdrawals[uid];
+    if (!w) return await sendMessage(chat_id, 'No pending withdrawal for this user.');
+    w.status = 'approved';
+    await sendMessage(uid, '✅ Your withdrawal has been approved and processed.');
+    await sendMessage(chat_id, `Withdrawal approved for user ${uid}.`);
+    delete pending_withdrawals[uid];
+  }
+
+  else if (text.startsWith('/withdraw_reject_') && chat_id.toString() === ADMIN_CHAT_ID) {
+    const uid = text.split('_')[2];
+    const w = pending_withdrawals[uid];
+    if (!w) return await sendMessage(chat_id, 'No pending withdrawal for this user.');
+    users[uid].wallet_balance += w.amount;
+    await sendMessage(uid, '❌ Your withdrawal was rejected. Contact @chieffundora for help.');
+    await sendMessage(chat_id, `Withdrawal rejected for user ${uid}.`);
+    delete pending_withdrawals[uid];
+  }
+
+  else {
+    await sendMessage(chat_id, 'Unknown command. Use /invest, /wallet, /withdraw, /refer');
   }
 }
 
-// --- EXPRESS SERVER FOR WEBHOOK ---
+// Express server
 const app = express();
 app.use(bodyParser.json());
 
-app.post(`/webhook`, async (req, res) => {
-  try {
-    await handleUpdate(req.body);
-  } catch (error) {
-    console.error('FATAL ERROR in handleUpdate:', error);
-  }
-  res.status(200).send('OK');
+app.post('/webhook', async (req, res) => {
+  await handleUpdate(req.body);
+  res.send('OK');
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`Bot server running on port ${PORT}`);
-  try {
-    if (!BOT_TOKEN || !ADMIN_CHAT_ID) {
-        console.error("FATAL: BOT_TOKEN or ADMIN_CHAT_ID is missing.");
-        return;
-    }
-    const response = await axios.get(`${API_URL}/setWebhook?url=${WEBHOOK_URL}`);
-    console.log(`Webhook set successfully to: ${WEBHOOK_URL}`);
-  } catch (e) {
-    console.error('Error setting webhook:', e.response ? e.response.data : e.message);
-  }
+app.listen(PORT, () => {
+  console.log('Bot server running on port', PORT);
 });
